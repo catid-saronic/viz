@@ -1,4 +1,3 @@
-#![cfg(target_arch = "wasm32")]
 
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use web_sys::{window, HtmlCanvasElement, WebGl2RenderingContext as GL};
