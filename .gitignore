@@ -1,0 +1,25 @@
+# Binaries & build artefacts
+target/
+
+# WASM-pack output
+pkg/
+static/pkg/
+
+# Dist folder (if generated elsewhere)
+dist/
+
+# IDEs / editors
+.idea/
+.vscode/
+*.sw?
+
+# Node / npm spill (if added later)
+node_modules/
+
+# OS junk
+*.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
