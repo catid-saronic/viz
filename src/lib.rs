@@ -5,8 +5,13 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
+    // Only enable wasm-bindgen-test when we are running tests. The macro and
+    // crate are unavailable in a normal (non-test) build, which is what `wasm-pack`
+    // invokes.
+    #[cfg(test)]
     use wasm_bindgen_test::wasm_bindgen_test_configure;
 
+    #[cfg(test)]
     wasm_bindgen_test_configure!(run_in_browser);
 
     mod render;

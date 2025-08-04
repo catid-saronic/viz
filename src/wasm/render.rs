@@ -1,5 +1,7 @@
+#![cfg(target_arch = "wasm32")]
+
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
-use web_sys::{HtmlCanvasElement, WebGl2RenderingContext as GL, window};
+use web_sys::{window, HtmlCanvasElement, WebGl2RenderingContext as GL};
 
 /// Start render loop – placeholder draws clear color changing.
 pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
@@ -24,7 +26,12 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     resize_closure.forget();
 
     // Animation loop
-    let f = std::rc::Rc::new(std::cell::RefCell::new(None));
+    // `f` holds the animation-frame closure so that we can keep calling
+    // `request_animation_frame` recursively. Storing it inside an `Option`
+    // allows us to create the `Closure` first and then obtain a reference to
+    // it from within itself.
+    let f: std::rc::Rc<std::cell::RefCell<Option<Closure<dyn FnMut()>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     let g = f.clone();
     let mut t: f32 = 0.0;
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {

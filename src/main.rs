@@ -21,9 +21,36 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Require wasm-pack to be present.
+    if Command::new("wasm-pack")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("wasm-pack not found. Please install it first – see README.md.");
+        std::process::exit(1);
+    }
+
+    let wasm_pack_exe = "wasm-pack";
+
+    // Ensure wasm32 target is added
+    // Ensure wasm32 target present; if missing instruct user and exit
+    if Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("wasm32-unknown-unknown"))
+        .unwrap_or(false)
+        == false
+    {
+        eprintln!("Rust target wasm32-unknown-unknown not installed. Run `rustup target add wasm32-unknown-unknown` and retry. See README.md.");
+        std::process::exit(1);
+    }
+
     // Build wasm bundle
     println!("Building WASM pkg …");
-    match Command::new("wasm-pack")
+    match Command::new(&wasm_pack_exe)
         .args([
             "build",
             "--release",
@@ -39,9 +66,16 @@ fn main() {
             eprintln!("wasm-pack finished with errors. Ensure wasm-pack is installed (https://rustwasm.github.io/wasm-pack/).");
             std::process::exit(1);
         }
-        Err(_) => {
-            eprintln!("wasm-pack not found in PATH. Skipping wasm build; the site may serve stale artifacts.");
+        Err(e) => {
+            eprintln!("Failed to run wasm-pack: {e}. You may need to install it manually.");
+            std::process::exit(1);
         }
+    }
+
+    // Ensure bundle produced
+    if !std::path::Path::new("static/pkg/viz_wasm.js").exists() {
+        eprintln!("WASM bundle missing after build – aborting server start.");
+        std::process::exit(1);
     }
 
     // 2. Start simple HTTP server serving `static/` on 8000

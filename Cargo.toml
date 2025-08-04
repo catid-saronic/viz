@@ -24,5 +24,14 @@ fs_extra = "1.3"
 wasm-bindgen-test = "0.3"
 
 [profile.release]
-opt-level = "s"
-lto = true
+# Favour fast build times for iterative development; size can be optimised later
+# via `wasm-opt` or enabling LTO explicitly when doing a production build.
+opt-level = "s"       # keep binaries small
+lto = false            # disabling LTO shortens link time considerably
+debug = false          # omit DWARF to keep .wasm small and speed up linking
+
+# ------------------------------------------------------------------------------------
+# wasm-pack configuration
+# ------------------------------------------------------------------------------------
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false       # skip wasm-opt; use it manually in CI for final artifacts

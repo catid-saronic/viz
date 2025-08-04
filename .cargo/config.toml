@@ -1,0 +1,13 @@
+[build]
+# Share artefacts between native and Wasm builds explicitly (the default target
+# directory is already `target` but this makes the intention clear and allows
+# users to override it from the environment).
+target-dir = "target"
+
+# Strip symbols during the link step so that wasm-ld performs less work and the
+# final artefact is smaller.  This has the same effect as calling `wasm-strip`
+# afterwards.
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-s"]
+
