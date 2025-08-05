@@ -79,9 +79,20 @@ fn main() {
     }
 
     // 2. Start simple HTTP server serving `static/` on 8000
-    println!("Launching local server at http://127.0.0.1:8000 …");
+    println!("Launching local server at http://0.0.0.0:8000 …");
+    // Bind explicitly to 0.0.0.0 so the service is reachable from outside
+    // the host machine (e.g. mobile devices on the same network) without
+    // requiring ngrok or a similar tunnel.
     let _server = Command::new("python3")
-        .args(["-m", "http.server", "8000", "--directory", "static"])
+        .args([
+            "-m",
+            "http.server",
+            "8000",
+            "--bind",
+            "0.0.0.0",
+            "--directory",
+            "static",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

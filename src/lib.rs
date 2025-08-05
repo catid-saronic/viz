@@ -16,6 +16,17 @@ mod wasm {
 
     mod render;
 
+    /// Update the upper-left overlay text from Rust.
+    #[wasm_bindgen]
+    pub fn set_overlay_text(text: &str) -> Result<(), JsValue> {
+        let window = web_sys::window().ok_or("no window")?;
+        let document = window.document().ok_or("no document")?;
+        if let Some(elem) = document.get_element_by_id("overlay") {
+            elem.set_text_content(Some(text));
+        }
+        Ok(())
+    }
+
     #[wasm_bindgen(start)]
     pub fn main() -> Result<(), JsValue> {
         let window = web_sys::window().ok_or("no window")?;

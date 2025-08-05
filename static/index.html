@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Rust WASM Visualizer</title>
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <style>
       html,
       body {
@@ -19,14 +20,241 @@
     </style>
   </head>
   <body>
+    <div id="overlay"></div>
     <canvas id="c"></canvas>
+
+    <!-- Fullscreen button visible in preview mode -->
+    <button id="fs-btn" aria-label="Enter presentation mode">⛶</button>
     <meta http-equiv="Cache-Control" content="no-store" />
     <meta http-equiv="Pragma" content="no-cache" />
+
+    <style>
+      #overlay {
+        position: fixed;
+        top: 0.5rem;
+        left: 0.75rem;
+        color: #fff;
+        font-family: sans-serif;
+        font-size: 1.25rem;
+        pointer-events: none;
+        -webkit-text-stroke: 1px #000;
+        text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000,
+          1px 1px 0 #000;
+        z-index: 10001;
+      }
+
+      /* Hide overlay during presentation mode */
+      :fullscreen #overlay,
+      .is-fake-fullscreen #overlay {
+        display: none;
+      }
+      #fs-btn {
+        position: fixed;
+        right: 1rem;
+        bottom: 1rem;
+        font-size: 2rem;
+        padding: 0.75rem 1rem;
+        background: rgba(255, 255, 255, 0.15);
+        border: none;
+        border-radius: 0.5rem;
+        color: #fff;
+        cursor: pointer;
+        z-index: 10000;
+        backdrop-filter: blur(4px);
+        transition: background 0.15s ease;
+      }
+
+      #fs-btn:hover,
+      #fs-btn:focus-visible {
+        background: rgba(255, 255, 255, 0.3);
+        outline: none;
+      }
+
+      /* Hide the button in presentation (fullscreen) mode */
+      :fullscreen #fs-btn,
+      .is-fake-fullscreen #fs-btn {
+        display: none;
+      }
+    </style>
 
     <script type="module">
       const ts = Date.now();
       import(`./pkg/viz_wasm.js?cache=${ts}`).then((m) => m.default());
+
+      const fsBtn = document.getElementById('fs-btn');
+      const canvas = document.getElementById('c');
+
+      /* ---------- Fullscreen helpers ---------- */
+      function prefixed(methods, ctx) {
+        return methods.find((m) => m in ctx);
+      }
+
+      function canGoFull() {
+        return !!prefixed(
+          [
+            'requestFullscreen',
+            'webkitRequestFullscreen',
+            'mozRequestFullScreen',
+            'msRequestFullscreen',
+          ],
+          Element.prototype,
+        );
+      }
+
+      function canExitFull() {
+        return !!prefixed(
+          [
+            'exitFullscreen',
+            'webkitExitFullscreen',
+            'mozCancelFullScreen',
+            'msExitFullscreen',
+          ],
+          document,
+        );
+      }
+
+      let prevScroll = 0;
+      let fakeTarget = null;
+
+      function resizeFake() {
+        if (fakeTarget) {
+          fakeTarget.style.height = `${window.innerHeight}px`;
+        }
+      }
+
+      function fakeFullscreen(el) {
+        if (fakeTarget) return Promise.resolve(true);
+
+        fakeTarget = el;
+        document.documentElement.classList.add('is-fake-fullscreen');
+
+        prevScroll = window.scrollY;
+
+        const vh = window.innerHeight;
+        Object.assign(el.style, {
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          width: '100vw',
+          height: `${vh}px`,
+          zIndex: 2147483647,
+          background: 'black',
+        });
+
+        document.body.style.overflow = 'hidden';
+
+        window.addEventListener('orientationchange', resizeFake, { passive: true });
+
+        return Promise.resolve(false);
+      }
+
+      function endFakeFullscreen() {
+        if (!fakeTarget) return false;
+
+        window.removeEventListener('orientationchange', resizeFake);
+
+        Object.assign(fakeTarget.style, {
+          position: '',
+          top: '',
+          left: '',
+          width: '',
+          height: '',
+          zIndex: '',
+          background: '',
+        });
+
+        document.body.style.overflow = '';
+        window.scrollTo(0, prevScroll);
+
+        document.documentElement.classList.remove('is-fake-fullscreen');
+
+        fakeTarget = null;
+        return true;
+      }
+
+      async function goFullscreen(target = document.documentElement) {
+        const req = prefixed(
+          [
+            'requestFullscreen',
+            'webkitRequestFullscreen',
+            'mozRequestFullScreen',
+            'msRequestFullscreen',
+          ],
+          target,
+        );
+
+        if (req) {
+          try {
+            await target[req]({ navigationUI: 'hide' });
+            return true;
+          } catch (err) {
+            /* ignore and fall back to fake */
+          }
+        }
+
+        return fakeFullscreen(target);
+      }
+
+      async function exitFullscreen() {
+        const exit = prefixed(
+          [
+            'exitFullscreen',
+            'webkitExitFullscreen',
+            'mozCancelFullScreen',
+            'msExitFullscreen',
+          ],
+          document,
+        );
+
+        if (exit) {
+          try {
+            await document[exit]();
+            return true;
+          } catch {
+            /* ignore */
+          }
+        }
+
+        return endFakeFullscreen();
+      }
+
+      /* ---------- Mode management ---------- */
+      async function enterPresentation() {
+        await goFullscreen(document.documentElement);
+      }
+
+      async function leavePresentation() {
+        await exitFullscreen();
+      }
+
+      fsBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        enterPresentation();
+      });
+
+      // Clicking anywhere in presentation mode exits
+      document.addEventListener('click', () => {
+        if (document.fullscreenElement || fakeTarget) {
+          leavePresentation();
+        }
+      });
+
+      // ESC key exits
+      document.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape' && (document.fullscreenElement || fakeTarget)) {
+          leavePresentation();
+        }
+      });
+
+      // Keep button visibility in sync with real fullscreen changes
+      ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach(
+        (type) => {
+          document.addEventListener(type, () => {
+            const isFs = !!(document.fullscreenElement || fakeTarget);
+            fsBtn.style.display = isFs ? 'none' : 'block';
+          });
+        },
+      );
     </script>
   </body>
 </html>
-
