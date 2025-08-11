@@ -17,6 +17,7 @@ web-sys = { version = "0.3", features = [
     "WebGlProgram", "WebGlShader", "WebGlBuffer", "WebGlUniformLocation",
     "console", "Performance", "DomException", "HtmlElement", "Element",
     "KeyboardEvent", "WebGlVertexArrayObject", "WebGlTexture", "WebGlFramebuffer",
+    "CssStyleDeclaration",
 ] }
 
 [build-dependencies]

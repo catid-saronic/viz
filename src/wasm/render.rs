@@ -21,23 +21,24 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     // Doing this via a small closure keeps the logic in one place so we can invoke
     // it both on start-up and for every resize event.
     let adjust_size = |canvas: &HtmlCanvasElement, gl: &GL| {
-        let w = window()
-            .unwrap()
-            .inner_width()
-            .unwrap()
-            .as_f64()
-            .unwrap();
-        let h = window()
-            .unwrap()
-            .inner_height()
-            .unwrap()
-            .as_f64()
-            .unwrap();
+        let win = window().unwrap();
+        let css_w = win.inner_width().unwrap().as_f64().unwrap();
+        let css_h = win.inner_height().unwrap().as_f64().unwrap();
+        let dpr = win.device_pixel_ratio();
+
+        let px_w = (css_w * dpr).round() as u32;
+        let px_h = (css_h * dpr).round() as u32;
+
         // Only update if a change is actually required to avoid needless work.
-        if canvas.width() != w as u32 || canvas.height() != h as u32 {
-            canvas.set_width(w as u32);
-            canvas.set_height(h as u32);
-            gl.viewport(0, 0, w as i32, h as i32);
+        if canvas.width() != px_w || canvas.height() != px_h {
+            let elem: &web_sys::HtmlElement = canvas.unchecked_ref();
+            let style = elem.style();
+            let _ = style.set_property("width", &format!("{}px", css_w));
+            let _ = style.set_property("height", &format!("{}px", css_h));
+
+            canvas.set_width(px_w);
+            canvas.set_height(px_h);
+            gl.viewport(0, 0, px_w as i32, px_h as i32);
         }
     };
 
@@ -48,8 +49,10 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     struct Post {
         prog: WebGlProgram,
         vbo: web_sys::WebGlBuffer,
-        fbo: WebGlFramebuffer,
-        tex: WebGlTexture,
+        fbo_scene: WebGlFramebuffer,
+        tex_scene: WebGlTexture,
+        fbo_mask: WebGlFramebuffer,
+        tex_mask: WebGlTexture,
         w: i32,
         h: i32,
     }
@@ -155,6 +158,134 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
             }
             "#;
 
+            // Post fragment shader with stripes clipped by mask
+            let fsrc = r#"#version 300 es
+            precision mediump float;
+            out vec4 o;
+            uniform sampler2D u_src;
+            uniform sampler2D u_mask;
+            uniform vec2 u_resolution;
+            uniform float u_time;
+            uniform float u_stripe_theta0;
+            uniform float u_stripe_theta_speed;
+            uniform float u_stripe_density;
+            uniform float u_stripe_thickness;
+            uniform vec2  u_stripe_drift_speed;
+            uniform float u_color_speed;
+            // Polka dot uniforms
+            uniform float u_fill_mode; // 0 = stripes, 1 = polka
+            uniform float u_dot_theta0;
+            uniform float u_dot_theta_speed;
+            uniform vec2  u_dot_drift_speed;
+            uniform float u_dot_density;       // average dots per unit
+            uniform float u_dot_radius_min;    // min radius in UV units
+            uniform float u_dot_radius_max;    // max radius in UV units
+
+            vec3 sample_src(vec2 uv){
+                vec2 c = uv - 0.5; float r = length(c); float ca = 0.002 * r;
+                vec3 col; col.r = texture(u_src, uv + ca * normalize(c)).r; col.g = texture(u_src, uv).g; col.b = texture(u_src, uv - ca * normalize(c)).b; return col;
+            }
+
+            vec3 hsv2rgb(vec3 c){
+                vec3 p = abs(fract(c.xxx + vec3(0.0, 2.0/6.0, 4.0/6.0)) * 6.0 - 3.0);
+                vec3 rgb = c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+                return rgb;
+            }
+
+            // Hash helpers for polka jitter
+            float hash11(float n) { return fract(sin(n)*43758.5453123); }
+            float hash12(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+            vec2  hash22(vec2 p) { return fract(sin(vec2(dot(p,vec2(127.1,311.7)), dot(p,vec2(269.5,183.3))))*43758.5453); }
+
+            void main(){
+                vec2 res = u_resolution;
+                // Compute a centered, square-normalized coordinate uv in [0,1]^2
+                float side = min(res.x, res.y);
+                vec2 origin = 0.5*(res - vec2(side));
+                vec2 uv = (gl_FragCoord.xy - origin) / side;
+                // Outside the centered square: black bars
+                if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+                    o = vec4(0.0,0.0,0.0,1.0);
+                    return;
+                }
+                // Aspect-correct square space where effects stay consistent across viewport sizes
+                vec2 a = vec2(min(res.x, res.y)) / res; // components <= 1
+                vec2 uv_sq = (uv - 0.5) * a + 0.5;
+
+                // Build displacement in square space
+                vec2 disp = vec2(0.0);
+                float wave = sin(uv_sq.y*12.0 + u_time*1.5) * 0.003; wave += sin((uv_sq.x+uv_sq.y)*10.0 - u_time*1.2) * 0.002; disp += vec2(wave, 0.0);
+                vec2 s1 = vec2(0.3+0.2*sin(u_time*0.4), 0.4+0.2*cos(u_time*0.35));
+                vec2 s2 = vec2(0.7+0.2*cos(u_time*0.37), 0.6+0.2*sin(u_time*0.31));
+                for(int i=0;i<2;i++){ vec2 c = (i==0)? s1 : s2; vec2 d = uv_sq - c; float r = length(d)+1e-4; float ang = 0.15 * sin(u_time*0.8 + r*25.0); mat2 rot = mat2(cos(ang),-sin(ang),sin(ang),cos(ang)); disp += (rot * d - d) * smoothstep(0.25, 0.0, r); }
+                for(int i=0; i<3; ++i){ vec2 seed = vec2(fract(sin(float(i)*12.9898+78.233)*43758.5453), fract(sin(float(i)*19.123+11.73)*24634.6345)); seed = 0.2 + 0.6*seed + 0.05*vec2(sin(u_time*(1.0+float(i)*0.3)+float(i)), cos(u_time*(1.2+float(i)*0.17)+float(i))); vec2 d = uv_sq - seed; float r = length(d); float r0 = 0.18 + 0.05*sin(u_time*1.7+float(i)); float amp = 0.008 * sin((r-r0)*40.0 - u_time*3.0); disp += normalize(d) * amp * smoothstep(r0, 0.0, r); }
+
+                // Apply displacement in square space, convert back to texture space for sampling
+                vec2 suv_sq = clamp(uv_sq + disp, 0.0, 1.0);
+                vec2 suv = (suv_sq - 0.5) / a + 0.5;
+
+                vec3 base = sample_src(suv);
+                float mask = texture(u_mask, suv).r;
+
+                // Diagonal zebra stripes (aspect-invariant)
+                float t = u_time;
+                float theta = u_stripe_theta0 + u_stripe_theta_speed * t;
+                mat2 R = mat2(cos(theta), -sin(theta), sin(theta), cos(theta));
+                vec2 q = R * (suv_sq - 0.5) + u_stripe_drift_speed * t;
+                float s = fract(q.y * u_stripe_density);
+                float stripeMask = step(s, clamp(u_stripe_thickness, 0.02, 0.98));
+                float hue = fract(q.x * (u_stripe_density*0.5) + t * u_color_speed);
+                vec3 rainbow = hsv2rgb(vec3(hue, 0.9, 1.0));
+                vec3 stripes = stripeMask * rainbow;
+
+                // Polka dots pattern (aspect-invariant)
+                float theta_d = u_dot_theta0 + u_dot_theta_speed * t;
+                mat2 RD = mat2(cos(theta_d), -sin(theta_d), sin(theta_d), cos(theta_d));
+                vec2 pd = RD * (suv_sq - 0.5) + u_dot_drift_speed * t + 0.5;
+                // Grid cell and local coords
+                float dens = max(2.0, u_dot_density);
+                vec2 g = pd * dens;
+                vec2 cell = floor(g);
+                vec2 f = fract(g);
+                // Random center jitter within cell
+                vec2 j = (hash22(cell) - 0.5) * 0.8; // up to 40% of cell size
+                vec2 center = 0.5 + j;
+                float rmin = max(0.005, u_dot_radius_min);
+                float rmax = max(rmin+0.002, u_dot_radius_max);
+                float r = mix(rmin, rmax, hash12(cell+13.17));
+                float d = length(f - center);
+                float dotMask = step(d, r);
+                float hue_d = fract((cell.x + cell.y*1.37) * 0.15 + t * u_color_speed);
+                vec3 dotColor = hsv2rgb(vec3(hue_d, 0.9, 1.0));
+                vec3 polka = dotMask * dotColor;
+
+                // Pick pattern: u_fill_mode 0 -> stripes, 1 -> polka
+                vec3 pattern = mix(stripes, polka, clamp(u_fill_mode, 0.0, 1.0));
+
+                // Flaming edges from source
+                vec2 px = 1.0 / u_resolution;
+                float l00 = dot(texture(u_src, suv + px*vec2(-1.0,-1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l10 = dot(texture(u_src, suv + px*vec2( 0.0,-1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l20 = dot(texture(u_src, suv + px*vec2( 1.0,-1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l01 = dot(texture(u_src, suv + px*vec2(-1.0, 0.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l21 = dot(texture(u_src, suv + px*vec2( 1.0, 0.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l02 = dot(texture(u_src, suv + px*vec2(-1.0, 1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l12 = dot(texture(u_src, suv + px*vec2( 0.0, 1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l22 = dot(texture(u_src, suv + px*vec2( 1.0, 1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float gx = (l20 + 2.0*l21 + l22) - (l00 + 2.0*l01 + l02);
+                float gy = (l02 + 2.0*l12 + l22) - (l00 + 2.0*l10 + l20);
+                float edge = clamp(length(vec2(gx,gy))*1.5, 0.0, 1.0);
+                float flicker = 0.6 + 0.4*sin(u_time*15.0 + suv.x*30.0 + suv.y*25.0);
+                vec3 flame = vec3(1.0, 0.5, 0.05) * pow(edge, 0.8) * flicker;
+
+                vec3 col = mix(vec3(0.0), pattern, mask);
+                col += flame * 0.6;
+                float v = smoothstep(0.95, 0.4, length(uv_sq-0.5));
+                col *= v;
+                o = vec4(col, 1.0);
+            }
+            "#;
+
             let prog = link_program(gl, vsrc, fsrc)?;
 
             // Fullscreen large triangle VBO
@@ -166,7 +297,7 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
                 gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &fa, GL::STATIC_DRAW);
             }
 
-            // Create texture and FBO
+            // Create scene texture and FBO
             let tex = gl.create_texture().ok_or("tex")?;
             gl.bind_texture(GL::TEXTURE_2D, Some(&tex));
             gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MIN_FILTER, GL::LINEAR as i32);
@@ -182,27 +313,54 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
             gl.framebuffer_texture_2d(GL::FRAMEBUFFER, GL::COLOR_ATTACHMENT0, GL::TEXTURE_2D, Some(&tex), 0);
             gl.bind_framebuffer(GL::FRAMEBUFFER, None);
 
-            Ok(Self { prog, vbo, fbo, tex, w, h })
+            // Mask texture and FBO
+            let tex_m = gl.create_texture().ok_or("masktex")?;
+            gl.bind_texture(GL::TEXTURE_2D, Some(&tex_m));
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MIN_FILTER, GL::LINEAR as i32);
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MAG_FILTER, GL::LINEAR as i32);
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_S, GL::CLAMP_TO_EDGE as i32);
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_T, GL::CLAMP_TO_EDGE as i32);
+            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+                GL::TEXTURE_2D, 0, GL::RGBA as i32, w, h, 0, GL::RGBA, GL::UNSIGNED_BYTE, None
+            )?;
+
+            let fbo_m = gl.create_framebuffer().ok_or("mfbo")?;
+            gl.bind_framebuffer(GL::FRAMEBUFFER, Some(&fbo_m));
+            gl.framebuffer_texture_2d(GL::FRAMEBUFFER, GL::COLOR_ATTACHMENT0, GL::TEXTURE_2D, Some(&tex_m), 0);
+            gl.bind_framebuffer(GL::FRAMEBUFFER, None);
+
+            Ok(Self { prog, vbo, fbo_scene: fbo, tex_scene: tex, fbo_mask: fbo_m, tex_mask: tex_m, w, h })
         }
 
         fn resize(&mut self, gl: &GL, w: i32, h: i32) -> Result<(), JsValue> {
             if self.w == w && self.h == h { return Ok(()); }
             self.w = w; self.h = h;
-            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex));
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex_scene));
+            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+                GL::TEXTURE_2D, 0, GL::RGBA as i32, w, h, 0, GL::RGBA, GL::UNSIGNED_BYTE, None
+            )?;
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex_mask));
             gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
                 GL::TEXTURE_2D, 0, GL::RGBA as i32, w, h, 0, GL::RGBA, GL::UNSIGNED_BYTE, None
             )?;
             Ok(())
         }
 
-        fn begin(&self, gl: &GL) {
-            gl.bind_framebuffer(GL::FRAMEBUFFER, Some(&self.fbo));
+        fn begin_scene(&self, gl: &GL) {
+            gl.bind_framebuffer(GL::FRAMEBUFFER, Some(&self.fbo_scene));
             gl.viewport(0, 0, self.w, self.h);
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(GL::COLOR_BUFFER_BIT);
         }
 
-        fn draw(&self, gl: &GL, time: f32) {
+        fn begin_mask(&self, gl: &GL) {
+            gl.bind_framebuffer(GL::FRAMEBUFFER, Some(&self.fbo_mask));
+            gl.viewport(0, 0, self.w, self.h);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(GL::COLOR_BUFFER_BIT);
+        }
+
+        fn draw(&self, gl: &GL, time: f32, sp: &PatternParams) {
             // Post-process pass: default framebuffer
             gl.bind_framebuffer(GL::FRAMEBUFFER, None);
             gl.viewport(0, 0, self.w, self.h);
@@ -213,10 +371,29 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
             gl.uniform2f(loc_res.as_ref(), self.w as f32, self.h as f32);
             let loc_time = gl.get_uniform_location(&self.prog, "u_time");
             gl.uniform1f(loc_time.as_ref(), time);
+            // stripe params
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_stripe_theta0").as_ref(), sp.theta0);
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_stripe_theta_speed").as_ref(), sp.theta_speed);
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_stripe_density").as_ref(), sp.density);
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_stripe_thickness").as_ref(), sp.thickness);
+            gl.uniform2f(gl.get_uniform_location(&self.prog, "u_stripe_drift_speed").as_ref(), sp.drift_x, sp.drift_y);
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_color_speed").as_ref(), sp.color_speed);
+            // polka
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_fill_mode").as_ref(), if sp.mode_polka { 1.0 } else { 0.0 });
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_dot_theta0").as_ref(), sp.dot_theta0);
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_dot_theta_speed").as_ref(), sp.dot_theta_speed);
+            gl.uniform2f(gl.get_uniform_location(&self.prog, "u_dot_drift_speed").as_ref(), sp.dot_drift_x, sp.dot_drift_y);
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_dot_density").as_ref(), sp.dot_density);
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_dot_radius_min").as_ref(), sp.dot_rmin);
+            gl.uniform1f(gl.get_uniform_location(&self.prog, "u_dot_radius_max").as_ref(), sp.dot_rmax);
             let loc_src = gl.get_uniform_location(&self.prog, "u_src");
             gl.active_texture(GL::TEXTURE0);
-            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex));
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex_scene));
             gl.uniform1i(loc_src.as_ref(), 0);
+            let loc_mask = gl.get_uniform_location(&self.prog, "u_mask");
+            gl.active_texture(GL::TEXTURE1);
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex_mask));
+            gl.uniform1i(loc_mask.as_ref(), 1);
 
             // geometry
             gl.bind_buffer(GL::ARRAY_BUFFER, Some(&self.vbo));
@@ -234,7 +411,8 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     trait Visualizer {
         fn name(&self) -> &'static str;
         fn init(&mut self, _gl: &GL) {}
-        fn render(&mut self, gl: &GL, t: f32);
+        fn render_mask(&mut self, gl: &GL, t: f32);
+        fn render_color(&mut self, gl: &GL, t: f32);
     }
 
     // ---------- WebGL helpers ----------
@@ -276,221 +454,134 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     // Basic circle line geometry prepared once and shared.
     const SEGMENTS: usize = 128;
 
-    // Vertex shader shared among visualizers – scales & rotates positions, outputs line width by default 1px.
-    const VERT_SRC: &str = r#"#version 300 es
-    precision mediump float;
-    layout(location = 0) in vec2 a_pos;
-    uniform float u_scale;
-    uniform float u_rot;
-    uniform vec2 u_aspect; // aspect-correct scale so shapes are not squished
-    void main() {
-        float c = cos(u_rot);
-        float s = sin(u_rot);
-        vec2 p = vec2(c * a_pos.x - s * a_pos.y, s * a_pos.x + c * a_pos.y);
-        p *= u_scale;
-        p *= u_aspect; // maintain consistent appearance across aspect ratios
-        gl_Position = vec4(p, 0.0, 1.0);
-    }
+    // Fullscreen vertex shader used by SDF-based visualizers
+    const VERT_FS: &str = r#"#version 300 es
+    layout(location=0) in vec2 a_pos;
+    void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }
     "#;
 
     // ---------- New Line-based Visualizers ----------
 
-    struct PulseCircle {
-        prog: Option<WebGlProgram>,
-    }
-
-    impl Default for PulseCircle {
-        fn default() -> Self {
-            Self { prog: None }
-        }
-    }
-
+    struct PulseCircle { prog_color: Option<WebGlProgram>, prog_mask: Option<WebGlProgram>, vbo: Option<web_sys::WebGlBuffer> }
+    impl Default for PulseCircle { fn default() -> Self { Self { prog_color: None, prog_mask: None, vbo: None } } }
     impl Visualizer for PulseCircle {
-        fn name(&self) -> &'static str {
-            "Pulsing Circle"
-        }
-
+        fn name(&self) -> &'static str { "Pulsing Circle" }
         fn init(&mut self, gl: &GL) {
-            let frag_src = r#"#version 300 es
-            precision mediump float;
-            uniform float u_time;
-            out vec4 o;
-            void main() {
-                float bright = 0.5 + 0.5 * sin(u_time);
-                o = vec4(vec3(bright), 1.0);
-            }"#;
-            self.prog = Some(link_program(gl, VERT_SRC, frag_src).unwrap());
+            let frag_common = r#"
+                precision mediump float;
+                uniform vec2 u_resolution; uniform float u_time; uniform float u_scale; uniform float u_rot; out vec4 o;
+                float sdCircle(vec2 p, float r){ return length(p)-r; }
+                vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot), s=sin(u_rot); return mat2(c,-s,s,c)*p; }
+            "#;
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdCircle(p,0.7); float a=smoothstep(0.0,-0.005,d); float bright=0.5+0.5*sin(u_time); o=vec4(vec3(bright), a); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdCircle(p,0.7); float a=step(d,0.0); o=vec4(a,a,a,1.0); }}", frag_common);
+            self.prog_color = Some(link_program(gl, VERT_FS, &frag_color).unwrap());
+            self.prog_mask = Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
+            // FS triangle
+            let verts: [f32; 6] = [ -1.0, -1.0, 3.0, -1.0, -1.0, 3.0 ];
+            let vbo = gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER, Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);} self.vbo=Some(vbo);
         }
-
-        fn render(&mut self, gl: &GL, t: f32) {
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(GL::COLOR_BUFFER_BIT);
-
-            let prog = self.prog.as_ref().unwrap();
-            gl.use_program(Some(prog));
-
-            let loc_scale = gl.get_uniform_location(prog, "u_scale");
-            gl.uniform1f(loc_scale.as_ref(), 0.8);
-            let loc_rot = gl.get_uniform_location(prog, "u_rot");
-            gl.uniform1f(loc_rot.as_ref(), 0.0);
-            // aspect correction based on drawing buffer size
-            let w = gl.drawing_buffer_width() as f32;
-            let h = gl.drawing_buffer_height() as f32;
-            let (sx, sy) = if w >= h { (h / w, 1.0) } else { (1.0, w / h) };
-            let loc_aspect = gl.get_uniform_location(prog, "u_aspect");
-            gl.uniform2f(loc_aspect.as_ref(), sx, sy);
-            let loc_time = gl.get_uniform_location(prog, "u_time");
-            gl.uniform1f(loc_time.as_ref(), t);
-
-            // build circle vbo on the fly
-            let mut verts: Vec<f32> = Vec::with_capacity(SEGMENTS * 2);
-            for i in 0..SEGMENTS {
-                let th = (i as f32 / SEGMENTS as f32) * std::f32::consts::PI * 2.0;
-                verts.push(th.cos());
-                verts.push(th.sin());
-            }
-            let vbo = gl.create_buffer().unwrap();
-            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&vbo));
-            unsafe {
-                let fa = js_sys::Float32Array::view(&verts);
-                gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &fa, GL::STATIC_DRAW);
-            }
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_with_i32(0, 2, GL::FLOAT, false, 0, 0);
-            gl.draw_arrays(GL::LINE_LOOP, 0, SEGMENTS as i32);
-            gl.disable_vertex_attrib_array(0);
+        fn render_mask(&mut self, gl: &GL, t: f32){
+            let prog=self.prog_mask.as_ref().unwrap(); gl.use_program(Some(prog));
+            let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32);
+            gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(), w,h);
+            gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(), t);
+            gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(), 1.0);
+            gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(), 0.0);
+            gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0);
+        }
+        fn render_color(&mut self, gl: &GL, t: f32){
+            let prog=self.prog_color.as_ref().unwrap(); gl.use_program(Some(prog));
+            let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32);
+            gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(), w,h);
+            gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(), t);
+            gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(), 1.0);
+            gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(), 0.0);
+            gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0);
         }
     }
 
-    struct RotatingSquare { prog: Option<WebGlProgram> }
-
-    impl Default for RotatingSquare { fn default() -> Self { Self { prog: None } } }
-
+    struct RotatingSquare { prog_color: Option<WebGlProgram>, prog_mask: Option<WebGlProgram>, vbo: Option<web_sys::WebGlBuffer> }
+    impl Default for RotatingSquare { fn default() -> Self { Self { prog_color: None, prog_mask: None, vbo: None } } }
     impl Visualizer for RotatingSquare {
         fn name(&self) -> &'static str { "Rotating Square" }
         fn init(&mut self, gl: &GL) {
-            let frag_src = r#"#version 300 es
-            precision mediump float;
-            out vec4 o; void main(){ o=vec4(1.0,0.3,0.0,1.0);}"#;
-            self.prog = Some(link_program(gl, VERT_SRC, frag_src).unwrap());
+            let frag_common = r#"
+                precision mediump float;
+                uniform vec2 u_resolution; uniform float u_time; uniform float u_scale; uniform float u_rot; out vec4 o;
+                float sdBox(vec2 p, vec2 b){ vec2 d=abs(p)-b; return length(max(d,0.0))+min(max(d.x,d.y),0.0); }
+                vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot), s=sin(u_rot); return mat2(c,-s,s,c)*p; }
+            "#;
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdBox(p, vec2(0.6)); float a=smoothstep(0.0,-0.005,d); o=vec4(1.0,0.3,0.0,a); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdBox(p, vec2(0.6)); float a=step(d,0.0); o=vec4(a,a,a,1.0); }}", frag_common);
+            self.prog_color = Some(link_program(gl, VERT_FS, &frag_color).unwrap());
+            self.prog_mask = Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
+            let verts:[f32;6]=[-1.0,-1.0,3.0,-1.0,-1.0,3.0]; let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);} self.vbo=Some(vbo);
         }
-        fn render(&mut self, gl: &GL, t: f32) {
-            gl.clear_color(0.0,0.0,0.0,1.0);
-            gl.clear(GL::COLOR_BUFFER_BIT);
-            let prog=self.prog.as_ref().unwrap();
-            gl.use_program(Some(prog));
-            let scale=gl.get_uniform_location(prog,"u_scale");
-            gl.uniform1f(scale.as_ref(),0.6);
-            let rot=gl.get_uniform_location(prog,"u_rot");
-            gl.uniform1f(rot.as_ref(),t);
-            let w = gl.drawing_buffer_width() as f32; let h = gl.drawing_buffer_height() as f32;
-            let (sx, sy) = if w >= h { (h / w, 1.0) } else { (1.0, w / h) };
-            let loc_aspect = gl.get_uniform_location(prog, "u_aspect");
-            gl.uniform2f(loc_aspect.as_ref(), sx, sy);
-
-            // square vertices
-            const SQ: [f32;8] = [ -1.0,-1.0, 1.0,-1.0, 1.0,1.0, -1.0,1.0 ];
-            let vbo=gl.create_buffer().unwrap();
-            gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo));
-            unsafe{ let fa=js_sys::Float32Array::view(&SQ); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);}            
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0);
-            gl.draw_arrays(GL::LINE_LOOP,0,4);
-            gl.disable_vertex_attrib_array(0);
-        }
+        fn render_mask(&mut self, gl:&GL, t:f32){ let prog=self.prog_mask.as_ref().unwrap(); gl.use_program(Some(prog)); let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32); gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(),w,h); gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(),t); gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),1.0); gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(), t); gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0); }
+        fn render_color(&mut self, gl:&GL, t:f32){ let prog=self.prog_color.as_ref().unwrap(); gl.use_program(Some(prog)); let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32); gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(),w,h); gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(),t); gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),1.0); gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(), t); gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0); }
     }
 
-    struct StarLines { prog: Option<WebGlProgram> }
-    impl Default for StarLines { fn default() -> Self { Self{prog:None} } }
+    struct StarLines { prog_color: Option<WebGlProgram>, prog_mask: Option<WebGlProgram>, vbo: Option<web_sys::WebGlBuffer> }
+    impl Default for StarLines { fn default()->Self{ Self{ prog_color:None, prog_mask:None, vbo:None } } }
     impl Visualizer for StarLines {
         fn name(&self)-> &'static str { "Twinkling Star" }
         fn init(&mut self, gl:&GL){
-            let frag_src=r#"#version 300 es
-            precision mediump float;
-            uniform float u_time; out vec4 o; void main(){ float blink=abs(sin(u_time*5.0)); o=vec4(1.0,1.0*blink,0.0,1.0);}"#;
-            self.prog=Some(link_program(gl,VERT_SRC,frag_src).unwrap());
+            let frag_common = r#"
+                precision mediump float; out vec4 o;
+                uniform vec2 u_resolution; uniform float u_time; uniform float u_scale; uniform float u_rot;
+                vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot),s=sin(u_rot); return mat2(c,-s,s,c)*p; }
+            "#;
+            // star via angular radius modulation
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float k=5.0; float r1=0.75, r2=0.35; float rr = mix(r1, r2, 0.5+0.5*cos(th*k)); float a = smoothstep(rr, rr-0.01, r); float blink=abs(sin(u_time*5.0)); vec3 col=vec3(1.0, blink, 0.0); o=vec4(col, a); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float k=5.0; float r1=0.75, r2=0.35; float rr = mix(r1, r2, 0.5+0.5*cos(th*k)); float a = step(r, rr); o=vec4(a,a,a,1.0); }}", frag_common);
+            self.prog_color=Some(link_program(gl, VERT_FS, &frag_color).unwrap());
+            self.prog_mask=Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
+            let verts:[f32;6]=[-1.0,-1.0,3.0,-1.0,-1.0,3.0]; let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);} self.vbo=Some(vbo);
         }
-        fn render(&mut self, gl:&GL,t:f32){
-            gl.clear_color(0.0,0.0,0.0,1.0); gl.clear(GL::COLOR_BUFFER_BIT);
-            let prog=self.prog.as_ref().unwrap(); gl.use_program(Some(prog));
-            gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),0.7);
-            gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(),t*0.5);
-            gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(),t);
-            let w = gl.drawing_buffer_width() as f32; let h = gl.drawing_buffer_height() as f32;
-            let (sx, sy) = if w >= h { (h / w, 1.0) } else { (1.0, w / h) };
-            let loc_aspect = gl.get_uniform_location(prog, "u_aspect");
-            gl.uniform2f(loc_aspect.as_ref(), sx, sy);
-
-            // star geometry 5-point lines
-            const V:[f32;10]=[0.0,1.0, -0.5878,-0.809, 0.9511,0.309, -0.9511,0.309, 0.5878,-0.809];
-            let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&V); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);}            
-            gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0);
-            gl.draw_arrays(GL::LINE_LOOP,0,5);
-            gl.disable_vertex_attrib_array(0);
-        }
+        fn render_mask(&mut self, gl:&GL,t:f32){ let prog=self.prog_mask.as_ref().unwrap(); gl.use_program(Some(prog)); let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32); gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(),w,h); gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(),t); gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),1.0); gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(), t*0.5); gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0);}        
+        fn render_color(&mut self, gl:&GL,t:f32){ let prog=self.prog_color.as_ref().unwrap(); gl.use_program(Some(prog)); let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32); gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(),w,h); gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(),t); gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),1.0); gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(), t*0.5); gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0);}        
     }
 
-    struct RadiatingSpokes { prog: Option<WebGlProgram> }
-    impl Default for RadiatingSpokes { fn default()->Self{Self{prog:None}} }
+    struct RadiatingSpokes { prog_color: Option<WebGlProgram>, prog_mask: Option<WebGlProgram>, vbo: Option<web_sys::WebGlBuffer> }
+    impl Default for RadiatingSpokes { fn default()->Self{Self{prog_color:None, prog_mask:None, vbo:None}} }
     impl Visualizer for RadiatingSpokes {
         fn name(&self)-> &'static str { "Radiating Spokes" }
         fn init(&mut self, gl:&GL){
-            let frag_src="#version 300 es\nprecision mediump float;out vec4 o; void main(){o=vec4(0.0,0.8,1.0,1.0);}";
-            self.prog=Some(link_program(gl,VERT_SRC,frag_src).unwrap());
+            let frag_common = r#"
+                precision mediump float; out vec4 o;
+                uniform vec2 u_resolution; uniform float u_time; uniform float u_scale; uniform float u_rot;
+                vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot),s=sin(u_rot); return mat2(c,-s,s,c)*p; }
+            "#;
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float n=18.0; float w=0.12; float band = abs(sin(th*n + u_time*0.6)); float m = smoothstep(w,w-0.01,band) * smoothstep(0.9,0.2,r); o=vec4(0.0,0.8,1.0,m); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float n=18.0; float w=0.12; float band = abs(sin(th*n + u_time*0.6)); float a = step(band,w) * step(r,0.95); o=vec4(a,a,a,1.0); }}", frag_common);
+            self.prog_color=Some(link_program(gl, VERT_FS, &frag_color).unwrap());
+            self.prog_mask=Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
+            let verts:[f32;6]=[-1.0,-1.0,3.0,-1.0,-1.0,3.0]; let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);} self.vbo=Some(vbo);
         }
-        fn render(&mut self, gl:&GL,t:f32){
-            gl.clear_color(0.0,0.0,0.0,1.0); gl.clear(GL::COLOR_BUFFER_BIT);
-            let prog=self.prog.as_ref().unwrap(); gl.use_program(Some(prog));
-            gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),1.0);
-            gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(),0.0);
-            let w = gl.drawing_buffer_width() as f32; let h = gl.drawing_buffer_height() as f32;
-            let (sx, sy) = if w >= h { (h / w, 1.0) } else { (1.0, w / h) };
-            let loc_aspect = gl.get_uniform_location(prog, "u_aspect");
-            gl.uniform2f(loc_aspect.as_ref(), sx, sy);
-
-            // build spokes dynamically
-            const SPOKES: usize = 20;
-            let mut verts: Vec<f32> = Vec::with_capacity(SPOKES * 4);
-            for i in 0..SPOKES {
-                let ang = (i as f32 / SPOKES as f32 + t*0.02) * std::f32::consts::PI * 2.0;
-                verts.push(0.0);
-                verts.push(0.0);
-                verts.push(ang.cos());
-                verts.push(ang.sin());
-            }
-            let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo));
-            unsafe{ let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::DYNAMIC_DRAW);}            
-            gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0);
-            gl.draw_arrays(GL::LINES,0,(SPOKES*2) as i32);
-            gl.disable_vertex_attrib_array(0);
-        }
+        fn render_mask(&mut self, gl:&GL,t:f32){ let prog=self.prog_mask.as_ref().unwrap(); gl.use_program(Some(prog)); let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32); gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(),w,h); gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(),t); gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),1.0); gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(), 0.0); gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0); }
+        fn render_color(&mut self, gl:&GL,t:f32){ let prog=self.prog_color.as_ref().unwrap(); gl.use_program(Some(prog)); let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32); gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(),w,h); gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(),t); gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),1.0); gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(), 0.0); gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0); }
     }
 
-    struct ExpandingCrossLines { prog: Option<WebGlProgram> }
-    impl Default for ExpandingCrossLines { fn default()->Self{Self{prog:None}} }
+    struct ExpandingCrossLines { prog_color: Option<WebGlProgram>, prog_mask: Option<WebGlProgram>, vbo: Option<web_sys::WebGlBuffer> }
+    impl Default for ExpandingCrossLines { fn default()->Self{Self{prog_color:None, prog_mask:None, vbo:None}} }
     impl Visualizer for ExpandingCrossLines {
-        fn name(&self)-> &'static str { "Pulsing Cross" }
+        fn name(&self)-> &'static str { "Pulsing Plus" }
         fn init(&mut self, gl:&GL){
-            let frag_src="#version 300 es\nprecision mediump float;out vec4 o;void main(){o=vec4(1.0,1.0,0.0,1.0);}";
-            self.prog=Some(link_program(gl,VERT_SRC,frag_src).unwrap());
+            let frag_common = r#"
+                precision mediump float; out vec4 o;
+                uniform vec2 u_resolution; uniform float u_time; uniform float u_scale; uniform float u_rot;
+                vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot),s=sin(u_rot); return mat2(c,-s,s,c)*p; }
+                float sdBox(vec2 p, vec2 b){ vec2 d=abs(p)-b; return length(max(d,0.0))+min(max(d.x,d.y),0.0); }
+            "#;
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=0.25+0.1*abs(sin(u_time*2.0)); float d=min(sdBox(p, vec2(0.8, th)), sdBox(p, vec2(th, 0.8))); float a=smoothstep(0.0,-0.005,d); o=vec4(1.0,1.0,0.0,a); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=0.25+0.1*abs(sin(u_time*2.0)); float a = step(min(sdBox(p, vec2(0.8, th)), sdBox(p, vec2(th, 0.8))), 0.0); o=vec4(a,a,a,1.0); }}", frag_common);
+            self.prog_color=Some(link_program(gl, VERT_FS, &frag_color).unwrap());
+            self.prog_mask=Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
+            let verts:[f32;6]=[-1.0,-1.0,3.0,-1.0,-1.0,3.0]; let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);} self.vbo=Some(vbo);
         }
-        fn render(&mut self, gl:&GL,t:f32){
-            gl.clear_color(0.0,0.0,0.0,1.0); gl.clear(GL::COLOR_BUFFER_BIT);
-            let prog=self.prog.as_ref().unwrap(); gl.use_program(Some(prog));
-            let scale=0.3+0.1*(t*2.0).sin().abs();
-            gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),scale);
-            gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(),0.0);
-            let w = gl.drawing_buffer_width() as f32; let h = gl.drawing_buffer_height() as f32;
-            let (sx, sy) = if w >= h { (h / w, 1.0) } else { (1.0, w / h) };
-            let loc_aspect = gl.get_uniform_location(prog, "u_aspect");
-            gl.uniform2f(loc_aspect.as_ref(), sx, sy);
-
-            let verts:[f32;8]=[ -1.0,0.0, 1.0,0.0, 0.0,-1.0, 0.0,1.0 ];
-            let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);}            
-            gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0);
-            gl.draw_arrays(GL::LINES,0,4);
-            gl.disable_vertex_attrib_array(0);
-        }
+        fn render_mask(&mut self, gl:&GL,t:f32){ let prog=self.prog_mask.as_ref().unwrap(); gl.use_program(Some(prog)); let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32); gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(),w,h); gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(),t); gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),1.0); gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(),0.0); gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0);}        
+        fn render_color(&mut self, gl:&GL,t:f32){ let prog=self.prog_color.as_ref().unwrap(); gl.use_program(Some(prog)); let (w,h)=(gl.drawing_buffer_width() as f32, gl.drawing_buffer_height() as f32); gl.uniform2f(gl.get_uniform_location(prog,"u_resolution").as_ref(),w,h); gl.uniform1f(gl.get_uniform_location(prog,"u_time").as_ref(),t); gl.uniform1f(gl.get_uniform_location(prog,"u_scale").as_ref(),1.0); gl.uniform1f(gl.get_uniform_location(prog,"u_rot").as_ref(),0.0); gl.bind_buffer(GL::ARRAY_BUFFER,self.vbo.as_ref()); gl.enable_vertex_attrib_array(0); gl.vertex_attrib_pointer_with_i32(0,2,GL::FLOAT,false,0,0); gl.draw_arrays(GL::TRIANGLES,0,3); gl.disable_vertex_attrib_array(0);}        
     }
 
     let mut viz_vec: Vec<Box<dyn Visualizer>> = vec![
@@ -509,6 +600,54 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     let visualizers = Rc::new(RefCell::new(viz_vec));
 
     const DURATION_MS: f64 = 20_000.0;
+
+    // Parameters controlling fill patterns, randomized on each visualizer change
+    #[derive(Clone, Copy)]
+    struct PatternParams {
+        // stripes
+        theta0: f32, theta_speed: f32, density: f32, thickness: f32, drift_x: f32, drift_y: f32,
+        // polka
+        mode_polka: bool,
+        dot_theta0: f32, dot_theta_speed: f32, dot_drift_x: f32, dot_drift_y: f32,
+        dot_density: f32, dot_rmin: f32, dot_rmax: f32,
+        // shared
+        color_speed: f32,
+    }
+    impl Default for PatternParams {
+        fn default() -> Self {
+            Self {
+                theta0: 0.0, theta_speed: 0.1, density: 16.0, thickness: 0.5, drift_x: 0.05, drift_y: 0.03,
+                mode_polka: false,
+                dot_theta0: 0.0, dot_theta_speed: 0.08, dot_drift_x: 0.03, dot_drift_y: -0.02,
+                dot_density: 10.0, dot_rmin: 0.05, dot_rmax: 0.18,
+                color_speed: 0.1,
+            }
+        }
+    }
+    fn frand() -> f32 { js_sys::Math::random() as f32 }
+    fn randomize_params(p: &Rc<RefCell<PatternParams>>) {
+        let mut s = p.borrow_mut();
+        s.theta0 = frand() * std::f32::consts::PI;
+        s.theta_speed = 0.05 + frand() * 0.3; // rad/s
+        s.density = 8.0 + frand() * 24.0;     // lines per unit
+        s.thickness = 0.15 + frand() * 0.7;   // 0..1 fraction
+        s.drift_x = (frand() * 2.0 - 1.0) * 0.15; // units/s
+        s.drift_y = (frand() * 2.0 - 1.0) * 0.15;
+        s.color_speed = 0.05 + frand() * 0.4; // hue cycles/s
+        // switch mode randomly
+        s.mode_polka = frand() > 0.5;
+        // polka params
+        s.dot_theta0 = frand() * std::f32::consts::TAU;
+        s.dot_theta_speed = 0.02 + frand() * 0.2;
+        s.dot_drift_x = (frand()*2.0 - 1.0) * 0.2;
+        s.dot_drift_y = (frand()*2.0 - 1.0) * 0.2;
+        s.dot_density = 6.0 + frand() * 20.0;
+        let rmin = 0.03 + frand() * 0.12;
+        let rmax = rmin + 0.03 + frand() * 0.2;
+        s.dot_rmin = rmin; s.dot_rmax = rmax;
+    }
+
+    let stripe_params = Rc::new(RefCell::new(PatternParams::default()));
 
     // ---------- Animation loop ----------
     // `f` holds the animation-frame closure so that we can keep calling
@@ -554,6 +693,7 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
         let visualizers_k = visualizers.clone();
         let current_index_k = current_index.clone();
         let segment_start_k = segment_start_ms.clone();
+        let stripe_params_k = stripe_params.clone();
         let keydown = Closure::wrap(Box::new(move |ev: web_sys::KeyboardEvent| {
             let key = ev.key();
             let code = ev.code();
@@ -573,6 +713,7 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
                     let next = if *idx == usize::MAX { 0 } else { (*idx + 1) % len };
                     *idx = next;
                     *segment_start_k.borrow_mut() = window().unwrap().performance().unwrap().now();
+                    randomize_params(&stripe_params_k);
                     let name = visualizers_k.borrow()[*idx].name();
                     let label = format!("{}/{} {}", *idx + 1, len, name);
                     let _ = super::set_overlay_text(&label);
@@ -596,6 +737,7 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
             let name = visualizers_clone.borrow()[0].name();
             let label = format!("{}/{} {}", 1, len, name);
             let _ = super::set_overlay_text(&label);
+            randomize_params(&stripe_params);
         }
         let elapsed_in_segment = now - *segment_start_ms.borrow();
         if elapsed_in_segment >= DURATION_MS {
@@ -605,14 +747,18 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
             let name = visualizers_clone.borrow()[*idx_ref].name();
             let label = format!("{}/{} {}", *idx_ref + 1, len, name);
             let _ = super::set_overlay_text(&label);
+            randomize_params(&stripe_params);
         }
         let local_t = ((now - *segment_start_ms.borrow()) / 1000.0) as f32;
         let idx_now = *current_index.borrow();
 
-        // Render current visualizer into offscreen target, then apply post-process to screen
-        post.borrow().begin(&gl_clone);
-        visualizers_clone.borrow_mut()[idx_now].render(&gl_clone, local_t);
-        post.borrow().draw(&gl_clone, (now as f32) / 1000.0);
+        // Render mask then scene into offscreen targets, then apply post-process to screen
+        post.borrow().begin_mask(&gl_clone);
+        visualizers_clone.borrow_mut()[idx_now].render_mask(&gl_clone, local_t);
+        post.borrow().begin_scene(&gl_clone);
+        visualizers_clone.borrow_mut()[idx_now].render_color(&gl_clone, local_t);
+        let sp = *stripe_params.borrow();
+        post.borrow().draw(&gl_clone, (now as f32) / 1000.0, &sp);
 
         // schedule next frame
         window()
