@@ -2,7 +2,10 @@
 #![cfg(target_arch = "wasm32")]
 
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
-use web_sys::{window, HtmlCanvasElement, WebGl2RenderingContext as GL, WebGlProgram, WebGlShader};
+use web_sys::{
+    window, HtmlCanvasElement, WebGl2RenderingContext as GL, WebGlProgram, WebGlShader,
+    WebGlTexture, WebGlFramebuffer
+};
 
 /// Start render loop – placeholder draws clear color changing.
 pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
@@ -41,18 +44,190 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     // Initial sizing so the canvas fits the window immediately.
     adjust_size(&canvas, &gl);
 
-    // Resize canvas whenever the window changes.
-    let resize_closure = {
-        let canvas = canvas.clone();
-        let gl = gl.clone();
-        Closure::wrap(Box::new(move || {
-            adjust_size(&canvas, &gl);
-        }) as Box<dyn FnMut()>)
-    };
-    window()
-        .unwrap()
-        .add_event_listener_with_callback("resize", resize_closure.as_ref().unchecked_ref())?;
-    resize_closure.forget();
+    // Offscreen framebuffer for post-processing
+    struct Post {
+        prog: WebGlProgram,
+        vbo: web_sys::WebGlBuffer,
+        fbo: WebGlFramebuffer,
+        tex: WebGlTexture,
+        w: i32,
+        h: i32,
+    }
+
+    impl Post {
+        fn new(gl: &GL, w: i32, h: i32) -> Result<Self, JsValue> {
+            let vsrc = r#"#version 300 es
+            layout(location=0) in vec2 a_pos;
+            void main(){ gl_Position = vec4(a_pos,0.0,1.0); }
+            "#;
+            let fsrc = r#"#version 300 es
+            precision mediump float;
+            out vec4 o;
+            uniform sampler2D u_src;
+            uniform vec2 u_resolution;
+            uniform float u_time;
+
+            // Hash/Noise helpers
+            float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123); }
+
+            vec3 sample_src(vec2 uv){
+                // subtle chromatic aberration based on distance from center
+                vec2 c = uv - 0.5;
+                float r = length(c);
+                float ca = 0.002 * r;
+                vec3 col;
+                col.r = texture(u_src, uv + ca * normalize(c)).r;
+                col.g = texture(u_src, uv).g;
+                col.b = texture(u_src, uv - ca * normalize(c)).b;
+                return col;
+            }
+
+            void main(){
+                vec2 uv = gl_FragCoord.xy / u_resolution;
+                vec2 center = vec2(0.5);
+                vec2 p = (uv - center);
+
+                // Accumulate displacement
+                vec2 disp = vec2(0.0);
+
+                // 1) Waves – large-scale ripple across screen
+                float wave = sin(uv.y*12.0 + u_time*1.5) * 0.003;
+                wave += sin((uv.x+uv.y)*10.0 - u_time*1.2) * 0.002;
+                disp += vec2(wave, 0.0);
+
+                // 2) Warp spirals – two drifting centers
+                vec2 s1 = vec2(0.3+0.2*sin(u_time*0.4), 0.4+0.2*cos(u_time*0.35));
+                vec2 s2 = vec2(0.7+0.2*cos(u_time*0.37), 0.6+0.2*sin(u_time*0.31));
+                for(int i=0;i<2;i++){
+                    vec2 c = (i==0)? s1 : s2;
+                    vec2 d = uv - c;
+                    float r = length(d)+1e-4;
+                    float ang = 0.15 * sin(u_time*0.8 + r*25.0);
+                    mat2 rot = mat2(cos(ang),-sin(ang),sin(ang),cos(ang));
+                    disp += (rot * d - d) * smoothstep(0.25, 0.0, r);
+                }
+
+                // 3) Bubbles – wobbling radial in/out around moving seeds
+                for(int i=0; i<3; ++i){
+                    vec2 seed = vec2(hash(vec2(float(i),0.123)), hash(vec2(float(i)+2.3,4.2)));
+                    seed = 0.2 + 0.6*seed + 0.05*vec2(sin(u_time*(1.0+float(i)*0.3)+float(i)), cos(u_time*(1.2+float(i)*0.17)+float(i)));
+                    vec2 d = uv - seed;
+                    float r = length(d);
+                    float r0 = 0.18 + 0.05*sin(u_time*1.7+float(i));
+                    float amp = 0.008 * sin((r-r0)*40.0 - u_time*3.0);
+                    disp += normalize(d) * amp * smoothstep(r0, 0.0, r);
+                }
+
+                // Apply displacement
+                vec2 suv = clamp(uv + disp, 0.0, 1.0);
+                vec3 col = sample_src(suv);
+
+                // 4) Edge flame – detect edges via Sobel on displaced UV
+                vec2 px = 1.0 / u_resolution;
+                float l00 = dot(texture(u_src, suv + px*vec2(-1.0,-1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l10 = dot(texture(u_src, suv + px*vec2( 0.0,-1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l20 = dot(texture(u_src, suv + px*vec2( 1.0,-1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l01 = dot(texture(u_src, suv + px*vec2(-1.0, 0.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l21 = dot(texture(u_src, suv + px*vec2( 1.0, 0.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l02 = dot(texture(u_src, suv + px*vec2(-1.0, 1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l12 = dot(texture(u_src, suv + px*vec2( 0.0, 1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float l22 = dot(texture(u_src, suv + px*vec2( 1.0, 1.0)).rgb, vec3(0.2126,0.7152,0.0722));
+                float gx = (l20 + 2.0*l21 + l22) - (l00 + 2.0*l01 + l02);
+                float gy = (l02 + 2.0*l12 + l22) - (l00 + 2.0*l10 + l20);
+                float edge = clamp(length(vec2(gx,gy))*1.5, 0.0, 1.0);
+                float flicker = 0.6 + 0.4*sin(u_time*15.0 + suv.x*30.0 + suv.y*25.0);
+                vec3 flame = vec3(1.0, 0.5, 0.05) * pow(edge, 0.8) * flicker;
+                col = col + flame * 0.6;
+
+                // 5) Solid stripes in low-luminance regions (background)
+                float baseLum = dot(texture(u_src, uv).rgb, vec3(0.2126,0.7152,0.0722));
+                float bands = floor((uv.y + 0.2*sin(u_time*0.25)) * 12.0);
+                if (mod(bands, 2.0) < 1.0 && baseLum < 0.18) {
+                    vec3 stripeCol = vec3(0.06, 0.06, 0.08) + 0.6*vec3(0.25+0.25*sin(u_time+bands*0.15), 0.35+0.2*sin(u_time*0.7), 0.6);
+                    col = stripeCol; // solid fill region
+                }
+
+                // Vignette for cohesion
+                float v = smoothstep(0.95, 0.4, length(uv-0.5));
+                col *= v;
+
+                o = vec4(col, 1.0);
+            }
+            "#;
+
+            let prog = link_program(gl, vsrc, fsrc)?;
+
+            // Fullscreen large triangle VBO
+            let verts: [f32; 6] = [ -1.0, -1.0, 3.0, -1.0, -1.0, 3.0 ];
+            let vbo = gl.create_buffer().ok_or("vbo")?;
+            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&vbo));
+            unsafe {
+                let fa = js_sys::Float32Array::view(&verts);
+                gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &fa, GL::STATIC_DRAW);
+            }
+
+            // Create texture and FBO
+            let tex = gl.create_texture().ok_or("tex")?;
+            gl.bind_texture(GL::TEXTURE_2D, Some(&tex));
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MIN_FILTER, GL::LINEAR as i32);
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MAG_FILTER, GL::LINEAR as i32);
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_S, GL::CLAMP_TO_EDGE as i32);
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_T, GL::CLAMP_TO_EDGE as i32);
+            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+                GL::TEXTURE_2D, 0, GL::RGBA as i32, w, h, 0, GL::RGBA, GL::UNSIGNED_BYTE, None
+            )?;
+
+            let fbo = gl.create_framebuffer().ok_or("fbo")?;
+            gl.bind_framebuffer(GL::FRAMEBUFFER, Some(&fbo));
+            gl.framebuffer_texture_2d(GL::FRAMEBUFFER, GL::COLOR_ATTACHMENT0, GL::TEXTURE_2D, Some(&tex), 0);
+            gl.bind_framebuffer(GL::FRAMEBUFFER, None);
+
+            Ok(Self { prog, vbo, fbo, tex, w, h })
+        }
+
+        fn resize(&mut self, gl: &GL, w: i32, h: i32) -> Result<(), JsValue> {
+            if self.w == w && self.h == h { return Ok(()); }
+            self.w = w; self.h = h;
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex));
+            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+                GL::TEXTURE_2D, 0, GL::RGBA as i32, w, h, 0, GL::RGBA, GL::UNSIGNED_BYTE, None
+            )?;
+            Ok(())
+        }
+
+        fn begin(&self, gl: &GL) {
+            gl.bind_framebuffer(GL::FRAMEBUFFER, Some(&self.fbo));
+            gl.viewport(0, 0, self.w, self.h);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(GL::COLOR_BUFFER_BIT);
+        }
+
+        fn draw(&self, gl: &GL, time: f32) {
+            // Post-process pass: default framebuffer
+            gl.bind_framebuffer(GL::FRAMEBUFFER, None);
+            gl.viewport(0, 0, self.w, self.h);
+            gl.use_program(Some(&self.prog));
+
+            // uniforms
+            let loc_res = gl.get_uniform_location(&self.prog, "u_resolution");
+            gl.uniform2f(loc_res.as_ref(), self.w as f32, self.h as f32);
+            let loc_time = gl.get_uniform_location(&self.prog, "u_time");
+            gl.uniform1f(loc_time.as_ref(), time);
+            let loc_src = gl.get_uniform_location(&self.prog, "u_src");
+            gl.active_texture(GL::TEXTURE0);
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex));
+            gl.uniform1i(loc_src.as_ref(), 0);
+
+            // geometry
+            gl.bind_buffer(GL::ARRAY_BUFFER, Some(&self.vbo));
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_with_i32(0, 2, GL::FLOAT, false, 0, 0);
+            gl.draw_arrays(GL::TRIANGLES, 0, 3);
+            gl.disable_vertex_attrib_array(0);
+        }
+    }
+
+    // (moved) Resize handling is set up after post-process initialization
 
     // ---------- Visualization framework ----------
 
@@ -351,6 +526,30 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
     let visualizers_clone = visualizers.clone();
     let gl_clone = gl.clone();
 
+    // Initialize post-process pipeline
+    let post = Rc::new(RefCell::new(Post::new(
+        &gl_clone,
+        gl_clone.drawing_buffer_width() as i32,
+        gl_clone.drawing_buffer_height() as i32,
+    )?));
+
+    // Resize: adjust canvas and the offscreen texture size
+    {
+        let canvas = canvas.clone();
+        let gl = gl.clone();
+        let post_rc = post.clone();
+        let resize_closure = Closure::wrap(Box::new(move || {
+            adjust_size(&canvas, &gl);
+            let w = gl.drawing_buffer_width() as i32;
+            let h = gl.drawing_buffer_height() as i32;
+            let _ = post_rc.borrow_mut().resize(&gl, w, h);
+        }) as Box<dyn FnMut()>);
+        window()
+            .unwrap()
+            .add_event_listener_with_callback("resize", resize_closure.as_ref().unchecked_ref())?;
+        resize_closure.forget();
+    }
+
     {
         let visualizers_k = visualizers.clone();
         let current_index_k = current_index.clone();
@@ -409,7 +608,11 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
         }
         let local_t = ((now - *segment_start_ms.borrow()) / 1000.0) as f32;
         let idx_now = *current_index.borrow();
+
+        // Render current visualizer into offscreen target, then apply post-process to screen
+        post.borrow().begin(&gl_clone);
         visualizers_clone.borrow_mut()[idx_now].render(&gl_clone, local_t);
+        post.borrow().draw(&gl_clone, (now as f32) / 1000.0);
 
         // schedule next frame
         window()

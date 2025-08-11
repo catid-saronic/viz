@@ -16,7 +16,7 @@ web-sys = { version = "0.3", features = [
     "Window", "Document", "HtmlCanvasElement", "WebGl2RenderingContext",
     "WebGlProgram", "WebGlShader", "WebGlBuffer", "WebGlUniformLocation",
     "console", "Performance", "DomException", "HtmlElement", "Element",
-    "KeyboardEvent",
+    "KeyboardEvent", "WebGlVertexArrayObject", "WebGlTexture", "WebGlFramebuffer",
 ] }
 
 [build-dependencies]
