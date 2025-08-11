@@ -209,8 +209,9 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
                     return;
                 }
                 // Aspect-correct square space where effects stay consistent across viewport sizes
+                // uv is already normalized to the centered square; use it directly
                 vec2 a = vec2(min(res.x, res.y)) / res; // components <= 1
-                vec2 uv_sq = (uv - 0.5) * a + 0.5;
+                vec2 uv_sq = uv;
 
                 // Build displacement in square space
                 vec2 disp = vec2(0.0);
@@ -222,6 +223,7 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
 
                 // Apply displacement in square space, convert back to texture space for sampling
                 vec2 suv_sq = clamp(uv_sq + disp, 0.0, 1.0);
+                // Map square UVs back into the inscribed square band of the rectangular textures
                 vec2 suv = (suv_sq - 0.5) / a + 0.5;
 
                 vec3 base = sample_src(suv);
@@ -316,8 +318,9 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
             // Mask texture and FBO
             let tex_m = gl.create_texture().ok_or("masktex")?;
             gl.bind_texture(GL::TEXTURE_2D, Some(&tex_m));
-            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MIN_FILTER, GL::LINEAR as i32);
-            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MAG_FILTER, GL::LINEAR as i32);
+            // Use NEAREST filtering for the mask to avoid edge expansion artifacts
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MIN_FILTER, GL::NEAREST as i32);
+            gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MAG_FILTER, GL::NEAREST as i32);
             gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_S, GL::CLAMP_TO_EDGE as i32);
             gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_T, GL::CLAMP_TO_EDGE as i32);
             gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
@@ -473,8 +476,8 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
                 float sdCircle(vec2 p, float r){ return length(p)-r; }
                 vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot), s=sin(u_rot); return mat2(c,-s,s,c)*p; }
             "#;
-            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdCircle(p,0.7); float a=smoothstep(0.0,-0.005,d); float bright=0.5+0.5*sin(u_time); o=vec4(vec3(bright), a); }}", frag_common);
-            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdCircle(p,0.7); float a=step(d,0.0); o=vec4(a,a,a,1.0); }}", frag_common);
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdCircle(p,0.7); float a=smoothstep(0.0,-0.005,d); float clip=1.0 - smoothstep(0.85, 1.0, length(p)); a*=clip; float bright=0.5+0.5*sin(u_time); o=vec4(vec3(bright), a); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdCircle(p,0.7); float a=step(d,0.0); float clip=1.0 - smoothstep(0.85, 1.0, length(p)); a*=clip; o=vec4(a,a,a,1.0); }}", frag_common);
             self.prog_color = Some(link_program(gl, VERT_FS, &frag_color).unwrap());
             self.prog_mask = Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
             // FS triangle
@@ -512,8 +515,8 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
                 float sdBox(vec2 p, vec2 b){ vec2 d=abs(p)-b; return length(max(d,0.0))+min(max(d.x,d.y),0.0); }
                 vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot), s=sin(u_rot); return mat2(c,-s,s,c)*p; }
             "#;
-            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdBox(p, vec2(0.6)); float a=smoothstep(0.0,-0.005,d); o=vec4(1.0,0.3,0.0,a); }}", frag_common);
-            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdBox(p, vec2(0.6)); float a=step(d,0.0); o=vec4(a,a,a,1.0); }}", frag_common);
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdBox(p, vec2(0.6)); float a=smoothstep(0.0,-0.005,d); float clip=1.0 - smoothstep(0.85, 1.0, length(p)); a*=clip; o=vec4(1.0,0.3,0.0,a); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float d=sdBox(p, vec2(0.6)); float a=step(d,0.0); float clip=1.0 - smoothstep(0.85, 1.0, length(p)); a*=clip; o=vec4(a,a,a,1.0); }}", frag_common);
             self.prog_color = Some(link_program(gl, VERT_FS, &frag_color).unwrap());
             self.prog_mask = Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
             let verts:[f32;6]=[-1.0,-1.0,3.0,-1.0,-1.0,3.0]; let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);} self.vbo=Some(vbo);
@@ -533,8 +536,8 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
                 vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot),s=sin(u_rot); return mat2(c,-s,s,c)*p; }
             "#;
             // star via angular radius modulation
-            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float k=5.0; float r1=0.75, r2=0.35; float rr = mix(r1, r2, 0.5+0.5*cos(th*k)); float a = smoothstep(rr, rr-0.01, r); float blink=abs(sin(u_time*5.0)); vec3 col=vec3(1.0, blink, 0.0); o=vec4(col, a); }}", frag_common);
-            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float k=5.0; float r1=0.75, r2=0.35; float rr = mix(r1, r2, 0.5+0.5*cos(th*k)); float a = step(r, rr); o=vec4(a,a,a,1.0); }}", frag_common);
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float k=5.0; float r1=0.75, r2=0.35; float rr = mix(r1, r2, 0.5+0.5*cos(th*k)); float a = smoothstep(rr, rr-0.01, r); float clip=1.0 - smoothstep(0.85, 1.0, r); a*=clip; float blink=abs(sin(u_time*5.0)); vec3 col=vec3(1.0, blink, 0.0); o=vec4(col, a); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float k=5.0; float r1=0.75, r2=0.35; float rr = mix(r1, r2, 0.5+0.5*cos(th*k)); float a = step(r, rr); float clip=1.0 - smoothstep(0.85, 1.0, r); a*=clip; o=vec4(a,a,a,1.0); }}", frag_common);
             self.prog_color=Some(link_program(gl, VERT_FS, &frag_color).unwrap());
             self.prog_mask=Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
             let verts:[f32;6]=[-1.0,-1.0,3.0,-1.0,-1.0,3.0]; let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);} self.vbo=Some(vbo);
@@ -553,8 +556,8 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
                 uniform vec2 u_resolution; uniform float u_time; uniform float u_scale; uniform float u_rot;
                 vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot),s=sin(u_rot); return mat2(c,-s,s,c)*p; }
             "#;
-            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float n=18.0; float w=0.12; float band = abs(sin(th*n + u_time*0.6)); float m = smoothstep(w,w-0.01,band) * smoothstep(0.9,0.2,r); o=vec4(0.0,0.8,1.0,m); }}", frag_common);
-            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float n=18.0; float w=0.12; float band = abs(sin(th*n + u_time*0.6)); float a = step(band,w) * step(r,0.95); o=vec4(a,a,a,1.0); }}", frag_common);
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float n=18.0; float w=0.12; float band = abs(sin(th*n + u_time*0.6)); float m = smoothstep(w,w-0.01,band) * smoothstep(0.9,0.2,r); float clip=1.0 - smoothstep(0.85, 1.0, r); m*=clip; o=vec4(0.0,0.8,1.0,m); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=atan(p.y,p.x); float r=length(p); float n=18.0; float w=0.12; float band = abs(sin(th*n + u_time*0.6)); float a = step(band,w) * step(r,0.95); float clip=1.0 - smoothstep(0.85, 1.0, r); a*=clip; o=vec4(a,a,a,1.0); }}", frag_common);
             self.prog_color=Some(link_program(gl, VERT_FS, &frag_color).unwrap());
             self.prog_mask=Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
             let verts:[f32;6]=[-1.0,-1.0,3.0,-1.0,-1.0,3.0]; let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);} self.vbo=Some(vbo);
@@ -574,8 +577,8 @@ pub fn start(canvas: HtmlCanvasElement) -> Result<(), JsValue> {
                 vec2 toP(vec2 uv){ vec2 res=u_resolution; vec2 a=vec2(min(res.x,res.y))/res; vec2 p=(uv*2.0-1.0)*a*u_scale; float c=cos(u_rot),s=sin(u_rot); return mat2(c,-s,s,c)*p; }
                 float sdBox(vec2 p, vec2 b){ vec2 d=abs(p)-b; return length(max(d,0.0))+min(max(d.x,d.y),0.0); }
             "#;
-            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=0.25+0.1*abs(sin(u_time*2.0)); float d=min(sdBox(p, vec2(0.8, th)), sdBox(p, vec2(th, 0.8))); float a=smoothstep(0.0,-0.005,d); o=vec4(1.0,1.0,0.0,a); }}", frag_common);
-            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=0.25+0.1*abs(sin(u_time*2.0)); float a = step(min(sdBox(p, vec2(0.8, th)), sdBox(p, vec2(th, 0.8))), 0.0); o=vec4(a,a,a,1.0); }}", frag_common);
+            let frag_color = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=0.25+0.1*abs(sin(u_time*2.0)); float d=min(sdBox(p, vec2(0.8, th)), sdBox(p, vec2(th, 0.8))); float a=smoothstep(0.0,-0.005,d); float clip=1.0 - smoothstep(0.85, 1.0, length(p)); a*=clip; o=vec4(1.0,1.0,0.0,a); }}", frag_common);
+            let frag_mask = format!("#version 300 es\n{}\nvoid main(){{ vec2 uv=gl_FragCoord.xy/u_resolution; vec2 p=toP(uv); float th=0.25+0.1*abs(sin(u_time*2.0)); float a = step(min(sdBox(p, vec2(0.8, th)), sdBox(p, vec2(th, 0.8))), 0.0); float clip=1.0 - smoothstep(0.85, 1.0, length(p)); a*=clip; o=vec4(a,a,a,1.0); }}", frag_common);
             self.prog_color=Some(link_program(gl, VERT_FS, &frag_color).unwrap());
             self.prog_mask=Some(link_program(gl, VERT_FS, &frag_mask).unwrap());
             let verts:[f32;6]=[-1.0,-1.0,3.0,-1.0,-1.0,3.0]; let vbo=gl.create_buffer().unwrap(); gl.bind_buffer(GL::ARRAY_BUFFER,Some(&vbo)); unsafe{let fa=js_sys::Float32Array::view(&verts); gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER,&fa,GL::STATIC_DRAW);} self.vbo=Some(vbo);
